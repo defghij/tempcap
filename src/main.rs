@@ -3,8 +3,25 @@
 #![feature(abi_avr_interrupt)]
 #![feature(cell_update)]
 
-use core::sync::atomic::AtomicBool;
 
+use avr_hal_generic::prelude::_unwrap_infallible_UnwrapInfallible;
+use panic_halt as _;
+
+use core::{
+    sync::atomic::{
+        Ordering,
+        AtomicBool
+    },
+    mem::MaybeUninit
+};
+use avr_device::{
+    atmega328p::{
+        TC0,
+        TC1
+    },
+    interrupt::Mutex
+};
+use dht11::Dht11;
 
 pub mod types {
     use arduino_hal::port::mode::Output;
@@ -17,7 +34,6 @@ pub mod types {
         }, clock::MHz16
     };
     use dht11::Dht11;
-    use panic_halt as _;
     use atmega_hal::{
         port::{
             PD1,
@@ -45,16 +61,6 @@ pub mod types {
     }
 }
 
-use avr_device::{atmega328p::{
-    TC0,
-    TC1
-}, interrupt::Mutex};
-use avr_hal_generic::prelude::_unwrap_infallible_UnwrapInfallible;
-use panic_halt as _;
-
-use core::sync::atomic::Ordering;
-use core::mem::MaybeUninit;
-use dht11::Dht11;
 use types::{
     SerialConsole,
     DHT11
@@ -165,6 +171,7 @@ pub mod sensor {
 
 }
 
+
 ///////////////////////////////////////////////////////////////////////////////////
 //// Interrupt One: Sensor Polling
 
@@ -194,6 +201,7 @@ pub fn setup_sensor_poll_interrupt(timer: TC1) {
     timer1.tcnt1.write( | w: &mut _ | w.bits(0)               ); // Timer Counter
     timer1.timsk1.write(| w: &mut _ | w.ocie1a().set_bit()    ); // Enable timer interrupt
 }
+
 
 ///////////////////////////////////////////////////////////////////////////////////
 //// Interrupt Zero: Time stamp
