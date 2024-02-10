@@ -14,12 +14,9 @@ use core::{
     },
     mem::MaybeUninit
 };
-use avr_device::{
-    atmega328p::{
+use avr_device::atmega328p::{
         TC0,
         TC1
-    },
-    interrupt::Mutex
 };
 use dht11::Dht11;
 
@@ -77,8 +74,7 @@ impl<T: Clone + Copy> Measurement<T> {
 
 static SENSOR_UPDATED: AtomicBool = AtomicBool::new(false);
 static mut DHT11_SENSOR: MaybeUninit<sensor::Dht11Sensor> = MaybeUninit::uninit();
-static mut TIMER0_COUTNER: u16 = 0;
-static mut SECONDS: Mutex<core::cell::Cell<u32>> = Mutex::new(core::cell::Cell::new(0));
+static mut TIMER0_COUNTER: u32 = 0;
 
 
 /// Module that contains all unsafe interactions with the `DHT11_SENSOR` global state.
@@ -174,49 +170,41 @@ pub mod sensor {
 
 ///////////////////////////////////////////////////////////////////////////////////
 //// Interrupt One: Sensor Polling
-
-#[avr_device::interrupt(atmega328p)]
-fn TIMER1_COMPA() {
-    avr_device::interrupt::free(|_cs| { sensor::record_measurement(); });
-}
+const TM1_FREQUENCY: u32 = 2;
+const TM1_PRESCALE:  u32 = 256;
+const TM1_CMR:       u32 = (16_000_000 / (TM1_PRESCALE * TM1_FREQUENCY)) - 1;
 
 ///  # TIMER
-///  The below sets up a 1/4 Hz, or 1 every 4 seconds, interrupt timer.
-///  We use TIMER1 because it has a 16b compare which is needed because
-///  the compare value is larger than 2^8.  
+///  The below sets up a 2Hz, or 2 every second, interrupt timer.
 ///  ---------------------------------------------------------------------
-///   interrupt_frequency = 1/4 (Hz) 
-///                       = 16_000_000 / (prescaler * cmp_match_reg + 1)
+///     interrupt_frequency = 2 (Hz) 
+///                         = 16_000_000 / (prescaler * cmp_match_reg + 1)
 ///   then,
-///   cmp_match_reg = (16_000_000 / (prescaler * interrupt_frequency)) - 1
-///                 = (16_000_000 / (1024 * 1/4) ) - 1
-///                 = (16_000_000 / 256 ) - 1
-///                 = 62499              // < 2**16
-///  ------------------------------------
+///     cmp_match_reg = (16_000_000 / (prescaler * interrupt_frequency)) - 1
+///  ---------------------------------------------------------------------
 pub fn setup_sensor_poll_interrupt(timer: TC1) {
     let timer1: TC1 = timer;                                    // Time with 16b compare
     timer1.tccr1a.write(| w: &mut _ | unsafe { w.bits(0) }    ); // Timer/Counter Control Register A 
-    timer1.tccr1b.write(| w: &mut _ | w.cs1().prescale_1024() ); // Timer/Counter Control Register B: Clock Select
-    timer1.ocr1a.write( | w: &mut _ | w.bits(62499)           ); // Output Compare Register
+    timer1.tccr1b.write(| w: &mut _ | w.cs1().prescale_256() ); // Timer/Counter Control Register B: Clock Select
+    timer1.ocr1a.write( | w: &mut _ | w.bits(TM1_CMR as u16)           ); // Output Compare Register
     timer1.tcnt1.write( | w: &mut _ | w.bits(0)               ); // Timer Counter
     timer1.timsk1.write(| w: &mut _ | w.ocie1a().set_bit()    ); // Enable timer interrupt
+}
+
+#[avr_device::interrupt(atmega328p)]
+fn TIMER1_COMPA() {
+    avr_device::interrupt::free(|_cs| {
+        let seconds: u32 = unsafe { TIMER0_COUNTER / 1000 };
+        if seconds.rem_euclid(10) == 0 { sensor::record_measurement(); }
+    });
 }
 
 
 ///////////////////////////////////////////////////////////////////////////////////
 //// Interrupt Zero: Time stamp
-
-#[avr_device::interrupt(atmega328p)]
-fn TIMER0_COMPA() {
-    avr_device::interrupt::free(|cs| {
-        unsafe {
-            TIMER0_COUTNER += 1;
-            if TIMER0_COUTNER.rem_euclid(1000) == 0 {
-                    SECONDS.borrow(cs).update(|x| x + 1);
-            }
-        }
-    });
-}
+const TM0_FREQUENCY: u32 = 1000;
+const TM0_PRESCALE:  u32 = 64;
+const TM0_CMR:       u32 = (16_000_000 / (TM0_PRESCALE * TM0_FREQUENCY)) - 1;
 
 ///  # TIMER
 ///  The below sets up a 1KHz, or 1,000 severy second, interrupt timer.
@@ -230,14 +218,24 @@ fn TIMER0_COMPA() {
 ///                 = (16_000_000 / (64 * 1000) ) - 1
 ///                 = (16_000_000 / 64_000 ) - 1
 ///                 = 246              // < 2^8
-///  ------------------------------------
+///  ---------------------------------------------------------------------
 pub fn setup_timestamp_interrupt(timer: TC0) {
     let timer0: TC0 = timer;                                     // Time with 8b compare
     timer0.tccr0a.write(| w: &mut _ | unsafe { w.bits(0) }    ); // Timer/Counter Control Register A 
     timer0.tccr0b.write(| w: &mut _ | w.cs0().prescale_64()   ); // Timer/Counter Control Register B: Clock Select
-    timer0.ocr0a.write( | w: &mut _ | w.bits(249)             ); // Output Compare Register
+    timer0.ocr0a.write( | w: &mut _ | w.bits(TM0_CMR as u8)       ); // Output Compare Register
     timer0.tcnt0.write( | w: &mut _ | w.bits(0)               ); // Timer Counter
     timer0.timsk0.write(| w: &mut _ | w.ocie0a().set_bit()    ); // Enable timer interrupt
+}
+
+#[avr_device::interrupt(atmega328p)]
+fn TIMER0_COMPA() {
+    avr_device::interrupt::free(|_cs| {
+        unsafe {
+            // Safety: This is the _only_ assignment to this memory location.
+            TIMER0_COUNTER += 1;
+        }
+    });
 }
 
 
@@ -264,25 +262,30 @@ fn main() -> ! {
 
     loop {
         if SENSOR_UPDATED.load(Ordering::SeqCst) {
+            //ufmt::uwrite!(serial, "{}","Updated\n").unwrap_infallible();
+
 
             // Enter an interrupt free critical section to retrieve
             // results from sensor and seconds from the timer.
-            let data: Option<(u32, Measurement<i16>,Measurement<u16>)> =  
-                avr_device::interrupt::free(|cs| { 
+            let data: Option<(u32, u32, Measurement<i16>,Measurement<u16>)> =  
+                avr_device::interrupt::free(|_cs| { 
                     match sensor::take_measurement() {
                         None => None,
                         Some(sensor_data) => {
-                            let seconds_elapsed = unsafe { SECONDS.borrow(cs).get() };
-                            Some((seconds_elapsed, sensor_data.0, sensor_data.1))
+                            let mili_seconds: u32 = unsafe { TIMER0_COUNTER };
+                            let seconds: u32 = mili_seconds/ 1000;
+                            let milis: u32  = mili_seconds - (seconds * 1000);
+
+                            Some((seconds, milis, sensor_data.0, sensor_data.1))
                         }
                     }
                 });
 
             if data.is_some() { // We got valid data, send it to console
-                let s: u32 = data.unwrap().0;
-                let t: Measurement<i16> = data.unwrap().1;
-                let h: Measurement<u16> = data.unwrap().2;
-                ufmt::uwrite!(serial, "{},{}.{},{}.{}\n", s, t.0, t.1, h.0, h.1).unwrap_infallible();
+                let (s, m, t ,h) = data.unwrap();
+                avr_device::interrupt::free(|_cs| {
+                    ufmt::uwrite!(serial, "{}.{},{}.{},{}.{}\n", s, m, t.0, t.1, h.0, h.1).unwrap_infallible();
+                });
             }
         }
         avr_device::asm::sleep(); // sleep until an interrupt is triggered.
