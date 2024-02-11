@@ -82,7 +82,6 @@ pub mod sensor {
     use super::{
         DHT11_SENSOR,
         SENSOR_UPDATED,
-        Measurement,
         Ordering,
         DHT11,
         Dht11,
@@ -91,7 +90,7 @@ pub mod sensor {
     pub struct Dht11Sensor {
         sensor: DHT11::Device,
         delay: DHT11::Delay, 
-        measurement: Option<(Measurement<i16>, Measurement<u16>)>,
+        measurement: Option<(i16, u16)>,
     } impl Dht11Sensor {
         pub fn new(pin: DHT11::InputPin) -> Dht11Sensor {
             let sensor= Dht11::new(pin);
@@ -103,19 +102,20 @@ pub mod sensor {
         /// data. Data is adjusted then placed in `self.measurement`. This
         /// is the only function to populate measurement with Some(_) 
         /// data.
+        ///
+        /// According to _https://www.wellpcb.com/dht11-datasheet.html_,
+        ///     - Operating range: 0-50C
+        ///     - Accuracy: +/- 2C (3.6F)
+        ///     - Resolution: 1C (1.8F)
         fn record_measurement(&mut self) {
-            let measurements: Option<(Measurement<i16>, Measurement<u16>)> = match self.sensor.perform_measurement(&mut self.delay) {
+            let measurements: Option<(i16, u16)> = match self.sensor.perform_measurement(&mut self.delay) {
                 Ok(reading) => {
                     let t = reading.temperature;
                     let h = reading.humidity;
                     let t_whole: i16 = ((t/10)  * 9) / 5 + 32;
-                    let t_tenth: i16 = 0; // okay due to accuracy: +/1 C which drops the tens place
-                    let h_tenth: u16 = h.rem_euclid(10);
                     let h_whole: u16 = h / 10;
-                    let temperature: Measurement<i16> = Measurement(t_whole, t_tenth);
-                    let humidity: Measurement<u16> = Measurement(h_whole, h_tenth);
 
-                    Some((temperature, humidity))
+                    Some((t_whole, h_whole))
                 },
                 Err(_) => None,
             };
@@ -125,7 +125,7 @@ pub mod sensor {
         /// Private function that returns the recorded measurements then
         /// unconditionally replaces it with None. The returned measurement
         /// could be None. This is the _only_ function to retrieve data.
-        fn take_measurements(&mut self) -> Option<(Measurement<i16>,Measurement<u16>)> {
+        fn take_measurements(&mut self) -> Option<(i16,u16)> {
             let m = self.measurement;
             self.measurement = None;
             m
@@ -155,7 +155,7 @@ pub mod sensor {
     /// in the main `loop` structure. Toggles the update flag to indicate
     /// data in sensor structure is now invalid.
     #[inline(always)]
-    pub fn take_measurement() -> Option<(Measurement<i16>, Measurement<u16>)> {
+    pub fn take_measurement() -> Option<(i16, u16)> {
 
         // Get a pointer to the sensor.
         let sensor: &mut Dht11Sensor = unsafe {
@@ -166,39 +166,6 @@ pub mod sensor {
     }
 
 }
-
-
-///////////////////////////////////////////////////////////////////////////////////
-//// Interrupt One: Sensor Polling
-const TM1_FREQUENCY: u32 = 2;
-const TM1_PRESCALE:  u32 = 256;
-const TM1_CMR:       u32 = (16_000_000 / (TM1_PRESCALE * TM1_FREQUENCY)) - 1;
-
-///  # TIMER
-///  The below sets up a 2Hz, or 2 every second, interrupt timer.
-///  ---------------------------------------------------------------------
-///     interrupt_frequency = 2 (Hz) 
-///                         = 16_000_000 / (prescaler * cmp_match_reg + 1)
-///   then,
-///     cmp_match_reg = (16_000_000 / (prescaler * interrupt_frequency)) - 1
-///  ---------------------------------------------------------------------
-pub fn setup_sensor_poll_interrupt(timer: TC1) {
-    let timer1: TC1 = timer;                                    // Time with 16b compare
-    timer1.tccr1a.write(| w: &mut _ | unsafe { w.bits(0) }    ); // Timer/Counter Control Register A 
-    timer1.tccr1b.write(| w: &mut _ | w.cs1().prescale_256() ); // Timer/Counter Control Register B: Clock Select
-    timer1.ocr1a.write( | w: &mut _ | w.bits(TM1_CMR as u16)           ); // Output Compare Register
-    timer1.tcnt1.write( | w: &mut _ | w.bits(0)               ); // Timer Counter
-    timer1.timsk1.write(| w: &mut _ | w.ocie1a().set_bit()    ); // Enable timer interrupt
-}
-
-#[avr_device::interrupt(atmega328p)]
-fn TIMER1_COMPA() {
-    avr_device::interrupt::free(|_cs| {
-        let seconds: u32 = unsafe { TIMER0_COUNTER / 1000 };
-        if seconds.rem_euclid(10) == 0 { sensor::record_measurement(); }
-    });
-}
-
 
 ///////////////////////////////////////////////////////////////////////////////////
 //// Interrupt Zero: Time stamp
@@ -238,6 +205,39 @@ fn TIMER0_COMPA() {
     });
 }
 
+///////////////////////////////////////////////////////////////////////////////////
+//// Interrupt One: Sensor Polling
+const TM1_FREQUENCY: u32 = 2;
+const TM1_PRESCALE:  u32 = 256;
+const TM1_CMR:       u32 = (16_000_000 / (TM1_PRESCALE * TM1_FREQUENCY)) - 1;
+
+///  # TIMER
+///  The below sets up a 2Hz, or 2 every second, interrupt timer.
+///  ---------------------------------------------------------------------
+///     interrupt_frequency = 2 (Hz) 
+///                         = 16_000_000 / (prescaler * cmp_match_reg + 1)
+///   then,
+///     cmp_match_reg = (16_000_000 / (prescaler * interrupt_frequency)) - 1
+///  ---------------------------------------------------------------------
+pub fn setup_sensor_poll_interrupt(timer: TC1) {
+    let timer1: TC1 = timer;                                    // Time with 16b compare
+    timer1.tccr1a.write(| w: &mut _ | unsafe { w.bits(0) }    ); // Timer/Counter Control Register A 
+    timer1.tccr1b.write(| w: &mut _ | w.cs1().prescale_256() ); // Timer/Counter Control Register B: Clock Select
+    timer1.ocr1a.write( | w: &mut _ | w.bits(TM1_CMR as u16)           ); // Output Compare Register
+    timer1.tcnt1.write( | w: &mut _ | w.bits(0)               ); // Timer Counter
+    timer1.timsk1.write(| w: &mut _ | w.ocie1a().set_bit()    ); // Enable timer interrupt
+}
+
+#[avr_device::interrupt(atmega328p)]
+fn TIMER1_COMPA() {
+    avr_device::interrupt::free(|_cs| {
+        let seconds: u32 = unsafe { TIMER0_COUNTER / TM0_FREQUENCY };
+        if seconds.rem_euclid(10) == 0 { sensor::record_measurement(); }
+    });
+}
+
+
+
 
 #[arduino_hal::entry]
 fn main() -> ! {
@@ -262,19 +262,17 @@ fn main() -> ! {
 
     loop {
         if SENSOR_UPDATED.load(Ordering::SeqCst) {
-            //ufmt::uwrite!(serial, "{}","Updated\n").unwrap_infallible();
-
 
             // Enter an interrupt free critical section to retrieve
             // results from sensor and seconds from the timer.
-            let data: Option<(u32, u32, Measurement<i16>,Measurement<u16>)> =  
+            let data: Option<(u32, u32, i16, u16)> =  
                 avr_device::interrupt::free(|_cs| { 
                     match sensor::take_measurement() {
                         None => None,
                         Some(sensor_data) => {
                             let mili_seconds: u32 = unsafe { TIMER0_COUNTER };
-                            let seconds: u32 = mili_seconds/ 1000;
-                            let milis: u32  = mili_seconds - (seconds * 1000);
+                            let seconds: u32 = mili_seconds/ TM0_FREQUENCY;
+                            let milis: u32  = mili_seconds - (seconds * TM0_FREQUENCY);
 
                             Some((seconds, milis, sensor_data.0, sensor_data.1))
                         }
@@ -284,7 +282,7 @@ fn main() -> ! {
             if data.is_some() { // We got valid data, send it to console
                 let (s, m, t ,h) = data.unwrap();
                 avr_device::interrupt::free(|_cs| {
-                    ufmt::uwrite!(serial, "{}.{},{}.{},{}.{}\n", s, m, t.0, t.1, h.0, h.1).unwrap_infallible();
+                    ufmt::uwrite!(serial, "{}.{},{},{}\n", s, m, t, h).unwrap_infallible();
                 });
             }
         }
